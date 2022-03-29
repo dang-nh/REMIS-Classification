@@ -1,101 +1,73 @@
 import argparse
-from data import create_dataset
-from utils import parse_configuration
-import math
-from models import create_model
-import time
-from utils.visualizer import Visualizer
+import collections
+import torch
+import numpy as np
+import data.classification_dataset as module_data
+import models.loss as module_loss
+import models.metric as module_metric
+import models.model as module_arch
+from parse_config import ConfigParser
+from trainer import Trainer
+from utils import prepare_device
 
-"""Performs training of a specified model.
-    
-Input params:
-    config_file: Either a string with the path to the JSON 
-        system-specific config file or a dictionary containing
-        the system-specific, dataset-specific and 
-        model-specific settings.
-    export: Whether to export the final model (default=True).
-"""
-def train(config_file, export=True):
-    print('Reading config file...')
-    configuration = parse_configuration(config_file)
 
-    print('Initializing dataset...')
-    train_dataset = create_dataset(configuration['train_dataset_params'])
-    train_dataset_size = len(train_dataset)
-    print('The number of training samples = {0}'.format(train_dataset_size))
+# fix random seeds for reproducibility
+SEED = 123
+torch.manual_seed(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+np.random.seed(SEED)
 
-    val_dataset = create_dataset(configuration['val_dataset_params'])
-    val_dataset_size = len(val_dataset)
-    print('The number of validation samples = {0}'.format(val_dataset_size))
+def main(config):
+    logger = config.get_logger('train')
 
-    print('Initializing model...')
-    model = create_model(configuration['model_params'])
-    model.setup()
+    # setup data_loader instances
+    data_loader = config.init_obj('data_loader', module_data)
+    valid_data_loader = data_loader.split_validation()
 
-    print('Initializing visualization...')
-    visualizer = Visualizer(configuration['visualization_params'])   # create a visualizer that displays images and plots
+    # build model architecture, then print to console
+    model = config.init_obj('arch', module_arch)
+    logger.info(model)
 
-    starting_epoch = configuration['model_params']['load_checkpoint'] + 1
-    num_epochs = configuration['model_params']['max_epochs']
+    # prepare for (multi-device) GPU training
+    device, device_ids = prepare_device(config['n_gpu'])
+    model = model.to(device)
+    if len(device_ids) > 1:
+        model = torch.nn.DataParallel(model, device_ids=device_ids)
 
-    for epoch in range(starting_epoch, num_epochs):
-        epoch_start_time = time.time()  # timer for entire epoch
-        train_dataset.dataset.pre_epoch_callback(epoch)
-        model.pre_epoch_callback(epoch)
+    # get function handles of loss and metrics
+    criterion = getattr(module_loss, config['loss'])
+    metrics = [getattr(module_metric, met) for met in config['metrics']]
 
-        train_iterations = len(train_dataset)
-        train_batch_size = configuration['train_dataset_params']['loader_params']['batch_size']
+    # build optimizer, learning rate scheduler. delete every lines containing lr_scheduler for disabling scheduler
+    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = config.init_obj('optimizer', torch.optim, trainable_params)
+    lr_scheduler = config.init_obj('lr_scheduler', torch.optim.lr_scheduler, optimizer)
 
-        model.train()
-        for i, data in enumerate(train_dataset):  # inner loop within one epoch
-            visualizer.reset()
+    trainer = Trainer(model, criterion, metrics, optimizer,
+                      config=config,
+                      device=device,
+                      data_loader=data_loader,
+                      valid_data_loader=valid_data_loader,
+                      lr_scheduler=lr_scheduler)
 
-            model.set_input(data)         # unpack data from dataset and apply preprocessing
-            model.forward()
-            model.backward()
+    trainer.train()
 
-            if i % configuration['model_update_freq'] == 0:
-                model.optimize_parameters()   # calculate loss functions, get gradients, update network weights
-
-            if i % configuration['printout_freq'] == 0:
-                losses = model.get_current_losses()
-                visualizer.print_current_losses(epoch, num_epochs, i, math.floor(train_iterations / train_batch_size), losses)
-                visualizer.plot_current_losses(epoch, float(i) / math.floor(train_iterations / train_batch_size), losses)
-
-        model.eval()
-        for i, data in enumerate(val_dataset):
-            model.set_input(data)
-            model.test()
-
-        model.post_epoch_callback(epoch, visualizer)
-        train_dataset.dataset.post_epoch_callback(epoch)
-
-        print('Saving model at the end of epoch {0}'.format(epoch))
-        model.save_networks(epoch)
-        model.save_optimizers(epoch)
-
-        print('End of epoch {0} / {1} \t Time Taken: {2} sec'.format(epoch, num_epochs, time.time() - epoch_start_time))
-
-        model.update_learning_rate() # update learning rates every epoch
-
-    if export:
-        print('Exporting model')
-        model.eval()
-        custom_configuration = configuration['train_dataset_params']
-        custom_configuration['loader_params']['batch_size'] = 1 # set batch size to 1 for tracing
-        dl = train_dataset.get_custom_dataloader(custom_configuration)
-        sample_input = next(iter(dl)) # sample input from the training dataset
-        model.set_input(sample_input)
-        model.export()
-
-    return model.get_hyperparam_result()
 
 if __name__ == '__main__':
-    import multiprocessing
-    multiprocessing.set_start_method('spawn', True)
+    args = argparse.ArgumentParser(description='PyTorch Template')
+    args.add_argument('-c', '--config', default=None, type=str,
+                      help='config file path (default: None)')
+    args.add_argument('-r', '--resume', default=None, type=str,
+                      help='path to latest checkpoint (default: None)')
+    args.add_argument('-d', '--device', default=None, type=str,
+                      help='indices of GPUs to enable (default: all)')
 
-    parser = argparse.ArgumentParser(description='Perform model training.')
-    parser.add_argument('configfile', help='path to the configfile')
-
-    args = parser.parse_args()
-    train(args.configfile)
+    # custom cli options to modify configuration from default values given in json file.
+    CustomArgs = collections.namedtuple('CustomArgs', 'flags type target')
+    options = [
+        CustomArgs(['--lr', '--learning_rate'], type=float, target='optimizer;args;lr'),
+        CustomArgs(['--bs', '--batch_size'], type=int, target='data_loader;args;batch_size')
+    ]
+    config = ConfigParser.from_args(args, options)
+    main(config)
